@@ -3,7 +3,29 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+// version: 2
+
 declare module 'vscode' {
+	/**
+	 * Represents the status of a chat session.
+	 */
+	export enum ChatSessionStatus {
+		/**
+		 * The chat session failed to complete.
+		 */
+		Failed = 0,
+
+		/**
+		 * The chat session completed successfully.
+		 */
+		Completed = 1,
+
+		/**
+		 * The chat session is currently in progress.
+		 */
+		InProgress = 2
+	}
+
 	/**
 	 * Provides a list of information about chat sessions.
 	 */
@@ -13,16 +35,31 @@ declare module 'vscode' {
 		 */
 		readonly onDidChangeChatSessionItems: Event<void>;
 
-		// /**
-		//  * Create a new chat session item
-		//  */
-		// provideNewChatSessionItem(context: {
-		// 	// This interface should be extracted
-		// 	readonly triggerChat?: {
-		// 		readonly prompt: string;
-		// 		readonly history: ReadonlyArray<ChatRequestTurn | ChatResponseTurn>;
-		// 	};
-		// }, token: CancellationToken): Thenable<ChatSessionItem> | ChatSessionItem;
+		/**
+		 * Event that the provider can fire to signal that the current (original) chat session should be replaced with a new (modified) chat session.
+		 * The UI can use this information to gracefully migrate the user to the new session.
+		 */
+		readonly onDidCommitChatSessionItem: Event<{ original: ChatSessionItem /** untitled */; modified: ChatSessionItem /** newly created */ }>;
+
+		/**
+		 * DEPRECATED: Will be removed!
+		 * Creates a new chat session.
+		 *
+		 * @param options Options for the new session including an optional initial prompt and history
+		 * @param token A cancellation token
+		 * @returns Metadata for the chat session
+		 */
+		provideNewChatSessionItem?(options: {
+			/**
+			 * The chat request that initiated the session creation
+			 */
+			readonly request: ChatRequest;
+
+			/**
+			 * Additional metadata to use for session creation
+			 */
+			metadata?: any;
+		}, token: CancellationToken): ProviderResult<ChatSessionItem>;
 
 		/**
 		 * Provides a list of chat sessions.
@@ -34,8 +71,17 @@ declare module 'vscode' {
 	export interface ChatSessionItem {
 		/**
 		 * Unique identifier for the chat session.
+		 *
+		 * @deprecated Will be replaced by `resource`
 		 */
 		id: string;
+
+		/**
+		 * The resource associated with the chat session.
+		 *
+		 * This is uniquely identifies the chat session and is used to open the chat session.
+		 */
+		resource: Uri | undefined;
 
 		/**
 		 * Human readable name of the session shown in the UI
@@ -46,10 +92,53 @@ declare module 'vscode' {
 		 * An icon for the participant shown in UI.
 		 */
 		iconPath?: IconPath;
+
+		/**
+		 * An optional description that provides additional context about the chat session.
+		 */
+		description?: string | MarkdownString;
+
+		/**
+		 * An optional status indicating the current state of the session.
+		 */
+		status?: ChatSessionStatus;
+
+		/**
+		 * The tooltip text when you hover over this item.
+		 */
+		tooltip?: string | MarkdownString;
+
+		/**
+		 * The times at which session started and ended
+		 */
+		timing?: {
+			/**
+			 * Session start timestamp in milliseconds elapsed since January 1, 1970 00:00:00 UTC.
+			 */
+			startTime: number;
+			/**
+			 * Session end timestamp in milliseconds elapsed since January 1, 1970 00:00:00 UTC.
+			 */
+			endTime?: number;
+		};
+
+		/**
+		 * Statistics about the chat session.
+		 */
+		statistics?: {
+			/**
+			 * Number of insertions made during the session.
+			 */
+			insertions: number;
+
+			/**
+			 * Number of deletions made during the session.
+			 */
+			deletions: number;
+		};
 	}
 
 	export interface ChatSession {
-
 		/**
 		 * The full history of the session
 		 *
@@ -58,6 +147,11 @@ declare module 'vscode' {
 		// TODO: Are these the right types to use?
 		// TODO: link request + response to encourage correct usage?
 		readonly history: ReadonlyArray<ChatRequestTurn | ChatResponseTurn2>;
+
+		/**
+		 * Options configured for this session.
+		 */
+		readonly options?: { model?: LanguageModelChatInformation };
 
 		/**
 		 * Callback invoked by the editor for a currently running response. This allows the session to push items for the
@@ -74,6 +168,7 @@ declare module 'vscode' {
 		 * If not set, then the session will be considered read-only and no requests can be made.
 		 */
 		// TODO: Should we introduce our own type for `ChatRequestHandler` since not all field apply to chat sessions?
+		// TODO: Revisit this to align with code.
 		readonly requestHandler: ChatRequestHandler | undefined;
 	}
 
@@ -85,6 +180,32 @@ declare module 'vscode' {
 		 * @param token A cancellation token that can be used to cancel the operation.
 		 */
 		provideChatSessionContent(sessionId: string, token: CancellationToken): Thenable<ChatSession> | ChatSession;
+
+		/**
+		 *
+		 * @param sessionId Identifier of the chat session being updated.
+		 * @param updates Collection of option identifiers and their new values. Only the options that changed are included.
+		 * @param token A cancellation token that can be used to cancel the notification if the session is disposed.
+		 */
+		provideHandleOptionsChange?(sessionId: string, updates: ReadonlyArray<ChatSessionOptionUpdate>, token: CancellationToken): void;
+
+		/**
+		 * Called as soon as you register (call me once)
+		 * @param token
+		 */
+		provideChatSessionProviderOptions?(token: CancellationToken): Thenable<ChatSessionProviderOptions> | ChatSessionProviderOptions;
+	}
+
+	export interface ChatSessionOptionUpdate {
+		/**
+		 * Identifier of the option that changed (for example `model`).
+		 */
+		readonly optionId: string;
+
+		/**
+		 * The new value assigned to the option. When `undefined`, the option is cleared.
+		 */
+		readonly value: string | undefined;
 	}
 
 	export namespace chat {
@@ -108,9 +229,39 @@ declare module 'vscode' {
 		 *
 		 * @returns A disposable that unregisters the provider when disposed.
 		 */
-		export function registerChatSessionContentProvider(chatSessionType: string, provider: ChatSessionContentProvider): Disposable;
+		export function registerChatSessionContentProvider(chatSessionType: string, provider: ChatSessionContentProvider, chatParticipant: ChatParticipant, capabilities?: ChatSessionCapabilities): Disposable;
 	}
 
+	export interface ChatContext {
+		readonly chatSessionContext?: ChatSessionContext;
+		readonly chatSummary?: {
+			readonly prompt?: string;
+			readonly history?: string;
+		};
+	}
+
+	export interface ChatSessionContext {
+		readonly chatSessionItem: ChatSessionItem; // Maps to URI of chat session editor (could be 'untitled-1', etc..)
+		readonly isUntitled: boolean;
+	}
+
+	export interface ChatSessionCapabilities {
+		/**
+		 * Whether sessions can be interrupted and resumed without side-effects.
+		 */
+		supportsInterruptions?: boolean;
+	}
+
+	export interface ChatSessionProviderOptions {
+		/**
+		 * Set of available models.
+		 */
+		models?: LanguageModelChatInformation[];
+	}
+
+	/**
+	 * @deprecated
+	 */
 	export interface ChatSessionShowOptions {
 		/**
 		 * The editor view column to show the chat session in.
@@ -123,6 +274,8 @@ declare module 'vscode' {
 	export namespace window {
 		/**
 		 * Shows a chat session in the panel or editor.
+		 *
+		 * @deprecated
 		 */
 		export function showChatSession(chatSessionType: string, sessionId: string, options: ChatSessionShowOptions): Thenable<void>;
 	}

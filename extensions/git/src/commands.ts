@@ -14,7 +14,7 @@ import { Model } from './model';
 import { GitResourceGroup, Repository, Resource, ResourceGroupType } from './repository';
 import { DiffEditorSelectionHunkToolbarContext, LineChange, applyLineChanges, getIndexDiffInformation, getModifiedRange, getWorkingTreeDiffInformation, intersectDiffWithRange, invertLineChange, toLineChanges, toLineRanges, compareLineChanges } from './staging';
 import { fromGitUri, toGitUri, isGitUri, toMergeUris, toMultiFileDiffEditorUris } from './uri';
-import { DiagnosticSeverityConfig, dispose, fromNow, grep, isDefined, isDescendant, isLinuxSnap, isRemote, isWindows, pathEquals, relativePath, toDiagnosticSeverity, truncate } from './util';
+import { DiagnosticSeverityConfig, dispose, fromNow, grep, isDefined, isDescendant, isLinuxSnap, isRemote, isWindows, pathEquals, relativePath, subject, toDiagnosticSeverity, truncate } from './util';
 import { GitTimelineItem } from './timelineProvider';
 import { ApiRepository } from './api/api1';
 import { getRemoteSourceActions, pickRemoteSource } from './remoteSource';
@@ -862,23 +862,32 @@ export class CommandCenter {
 		}
 
 		try {
-			const [head, rebaseOrMergeHead, diffBetween] = await Promise.all([
+			const [head, rebaseOrMergeHead, oursDiff, theirsDiff] = await Promise.all([
 				repo.getCommit('HEAD'),
 				isRebasing ? repo.getCommit('REBASE_HEAD') : repo.getCommit('MERGE_HEAD'),
-				await repo.diffBetween(isRebasing ? 'REBASE_HEAD' : 'MERGE_HEAD', 'HEAD')
+				await repo.diffBetween(isRebasing ? 'REBASE_HEAD' : 'MERGE_HEAD', 'HEAD'),
+				await repo.diffBetween('HEAD', isRebasing ? 'REBASE_HEAD' : 'MERGE_HEAD')
 			]);
-			const diffFile = diffBetween?.find(diff => diff.uri.fsPath === uri.fsPath);
+
+			const oursDiffFile = oursDiff?.find(diff => diff.uri.fsPath === uri.fsPath);
+			const theirsDiffFile = theirsDiff?.find(diff => diff.uri.fsPath === uri.fsPath);
 
 			// ours (current branch and commit)
 			current.detail = head.refNames.map(s => s.replace(/^HEAD ->/, '')).join(', ');
 			current.description = '$(git-commit) ' + head.hash.substring(0, 7);
-			current.uri = toGitUri(uri, head.hash);
+			if (theirsDiffFile) {
+				// use the original uri in case the file was renamed by theirs
+				current.uri = toGitUri(theirsDiffFile.originalUri, head.hash);
+			} else {
+				current.uri = toGitUri(uri, head.hash);
+			}
 
 			// theirs
 			incoming.detail = rebaseOrMergeHead.refNames.join(', ');
 			incoming.description = '$(git-commit) ' + rebaseOrMergeHead.hash.substring(0, 7);
-			if (diffFile) {
-				incoming.uri = toGitUri(diffFile.originalUri, rebaseOrMergeHead.hash);
+			if (oursDiffFile) {
+				// use the original uri in case the file was renamed by ours
+				incoming.uri = toGitUri(oursDiffFile.originalUri, rebaseOrMergeHead.hash);
 			} else {
 				incoming.uri = toGitUri(uri, rebaseOrMergeHead.hash);
 			}
@@ -1482,6 +1491,15 @@ export class CommandCenter {
 		for (const resource of resources) {
 			await resource.openChange();
 		}
+	}
+
+	@command('git.compareWithWorkspace')
+	async compareWithWorkspace(resource?: Resource): Promise<void> {
+		if (!resource) {
+			return;
+		}
+
+		await resource.compareWithWorkspace();
 	}
 
 	@command('git.rename', { repository: true })
@@ -2372,10 +2390,8 @@ export class CommandCenter {
 		let promptToSaveFilesBeforeCommit = config.get<'always' | 'staged' | 'never'>('promptToSaveFilesBeforeCommit');
 
 		// migration
-		if (promptToSaveFilesBeforeCommit as any === true) {
-			promptToSaveFilesBeforeCommit = 'always';
-		} else if (promptToSaveFilesBeforeCommit as any === false) {
-			promptToSaveFilesBeforeCommit = 'never';
+		if (typeof promptToSaveFilesBeforeCommit === 'boolean') {
+			promptToSaveFilesBeforeCommit = promptToSaveFilesBeforeCommit ? 'always' : 'never';
 		}
 
 		let enableSmartCommit = config.get<boolean>('enableSmartCommit') === true;
@@ -2938,7 +2954,25 @@ export class CommandCenter {
 				}
 
 				if (err.gitErrorCode === GitErrorCodes.WorktreeBranchAlreadyUsed) {
-					this.handleWorktreeBranchAlreadyUsed(err);
+					// Not checking out in a worktree (use standard error handling)
+					if (!repository.dotGit.commonPath) {
+						await this.handleWorktreeBranchAlreadyUsed(err);
+						return false;
+					}
+
+					// Check out in a worktree (check if worktree's main repository is open in workspace and if branch is already checked out in main repository)
+					const commonPath = path.dirname(repository.dotGit.commonPath);
+					if (workspace.workspaceFolders && workspace.workspaceFolders.some(folder => pathEquals(folder.uri.fsPath, commonPath))) {
+						const mainRepository = this.model.getRepository(commonPath);
+						if (mainRepository && item.refName && item.refName.replace(`${item.refRemote}/`, '') === mainRepository.HEAD?.name) {
+							const message = l10n.t('Branch "{0}" is already checked out in the current window.', item.refName);
+							await window.showErrorMessage(message, { modal: true });
+							return false;
+						}
+					}
+
+					// Check out in a worktree, (branch is already checked out in existing worktree)
+					await this.handleWorktreeBranchAlreadyUsed(err);
 					return false;
 				}
 
@@ -3407,6 +3441,109 @@ export class CommandCenter {
 		}
 	}
 
+	@command('git.migrateWorktreeChanges', { repository: true, repositoryFilter: ['repository', 'submodule'] })
+	async migrateWorktreeChanges(repository: Repository): Promise<void> {
+		const worktreePicks = async (): Promise<WorktreeItem[] | QuickPickItem[]> => {
+			const worktrees = await repository.getWorktrees();
+			return worktrees.length === 0
+				? [{ label: l10n.t('$(info) This repository has no worktrees.') }]
+				: worktrees.map(worktree => new WorktreeItem(worktree));
+		};
+
+		const placeHolder = l10n.t('Select a worktree to migrate changes from');
+		const choice = await this.pickRef<WorktreeItem | QuickPickItem>(worktreePicks(), placeHolder);
+
+		if (!choice || !(choice instanceof WorktreeItem)) {
+			return;
+		}
+
+		const worktreeRepository = this.model.getRepository(choice.worktree.path);
+		if (!worktreeRepository) {
+			return;
+		}
+
+		if (worktreeRepository.indexGroup.resourceStates.length === 0 &&
+			worktreeRepository.workingTreeGroup.resourceStates.length === 0 &&
+			worktreeRepository.untrackedGroup.resourceStates.length === 0) {
+			await window.showInformationMessage(l10n.t('There are no changes in the selected worktree to migrate.'));
+			return;
+		}
+
+		const worktreeChangedFilePaths = [
+			...worktreeRepository.indexGroup.resourceStates,
+			...worktreeRepository.workingTreeGroup.resourceStates,
+			...worktreeRepository.untrackedGroup.resourceStates
+		].map(resource => path.relative(worktreeRepository.root, resource.resourceUri.fsPath));
+
+		const targetChangedFilePaths = [
+			...repository.workingTreeGroup.resourceStates,
+			...repository.untrackedGroup.resourceStates
+		].map(resource => path.relative(repository.root, resource.resourceUri.fsPath));
+
+		// Detect overlapping unstaged files in worktree stash and target repository
+		const conflicts = worktreeChangedFilePaths.filter(path => targetChangedFilePaths.includes(path));
+
+		// Check for 'LocalChangesOverwritten' error
+		if (conflicts.length > 0) {
+			const maxFilesShown = 5;
+			const filesToShow = conflicts.slice(0, maxFilesShown);
+			const remainingCount = conflicts.length - maxFilesShown;
+
+			const fileList = filesToShow.join('\n ') +
+				(remainingCount > 0 ? l10n.t('\n and {0} more file{1}...', remainingCount, remainingCount > 1 ? 's' : '') : '');
+
+			const message = l10n.t('Your local changes to the following files would be overwritten by merge:\n {0}\n\nPlease stage, commit, or stash your changes in the repository before migrating changes.', fileList);
+			await window.showErrorMessage(message, { modal: true });
+			return;
+		}
+
+		const message = l10n.t('Proceed with migrating changes to the current repository?');
+		const detail = l10n.t('This will apply the worktree\'s changes to this repository and discard changes in the worktree.\nThis is IRREVERSIBLE!');
+		const proceed = l10n.t('Proceed');
+		const pick = await window.showWarningMessage(message, { modal: true, detail }, proceed);
+		if (pick !== proceed) {
+			return;
+		}
+
+		await worktreeRepository.createStash(undefined, true);
+		const stashes = await worktreeRepository.getStashes();
+
+		try {
+			await repository.applyStash(stashes[0].index);
+			worktreeRepository.dropStash(stashes[0].index);
+		} catch (err) {
+			if (err.gitErrorCode !== GitErrorCodes.StashConflict) {
+				await worktreeRepository.popStash();
+				throw err;
+			}
+			repository.isWorktreeMigrating = true;
+
+			const message = l10n.t('There are merge conflicts from migrating changes. Please resolve them before committing.');
+			const show = l10n.t('Show Changes');
+			const choice = await window.showWarningMessage(message, show);
+			if (choice === show) {
+				await commands.executeCommand('workbench.view.scm');
+			}
+			worktreeRepository.dropStash(stashes[0].index);
+		}
+	}
+
+	@command('git.openWorktreeMergeEditor')
+	async openWorktreeMergeEditor(uri: Uri): Promise<void> {
+		type InputData = { uri: Uri; title: string };
+		const mergeUris = toMergeUris(uri);
+
+		const current: InputData = { uri: mergeUris.ours, title: l10n.t('Workspace') };
+		const incoming: InputData = { uri: mergeUris.theirs, title: l10n.t('Worktree') };
+
+		await commands.executeCommand('_open.mergeEditor', {
+			base: mergeUris.base,
+			input1: current,
+			input2: incoming,
+			output: uri
+		});
+	}
+
 	@command('git.createWorktree')
 	async createWorktree(repository: any): Promise<void> {
 		repository = this.model.getRepository(repository);
@@ -3457,7 +3594,7 @@ export class CommandCenter {
 			return [createBranch, { label: '', kind: QuickPickItemKind.Separator }, ...branchItems];
 		};
 
-		const placeHolder = l10n.t('Select a branch to create the new worktree from');
+		const placeHolder = l10n.t('Select a branch or tag to create the new worktree from');
 		const choice = await this.pickRef(getBranchPicks(), placeHolder);
 
 		if (!choice) {
@@ -3658,7 +3795,6 @@ export class CommandCenter {
 		}
 		return;
 	}
-
 
 	@command('git.deleteWorktree', { repository: true, repositoryFilter: ['worktree'] })
 	async deleteWorktree(repository: Repository): Promise<void> {
@@ -4777,13 +4913,14 @@ export class CommandCenter {
 		const changes = await repository.diffTrees(commitParentId, commit.hash);
 		const resources = changes.map(c => toMultiFileDiffEditorUris(c, commitParentId, commit.hash));
 
-		const title = `${item.shortRef} - ${truncate(commit.message)}`;
+		const title = `${item.shortRef} - ${subject(commit.message)}`;
 		const multiDiffSourceUri = Uri.from({ scheme: 'scm-history-item', path: `${repository.root}/${commitParentId}..${commit.hash}` });
+		const reveal = { modifiedUri: toGitUri(uri, commit.hash) };
 
 		return {
 			command: '_workbench.openMultiDiffEditor',
 			title: l10n.t('Open Commit'),
-			arguments: [{ multiDiffSourceUri, title, resources }, options]
+			arguments: [{ multiDiffSourceUri, title, resources, reveal }, options]
 		};
 	}
 
@@ -5032,7 +5169,7 @@ export class CommandCenter {
 	}
 
 	@command('git.viewCommit', { repository: true })
-	async viewCommit(repository: Repository, historyItemId: string): Promise<void> {
+	async viewCommit(repository: Repository, historyItemId: string, revealUri?: Uri): Promise<void> {
 		if (!repository || !historyItemId) {
 			return;
 		}
@@ -5042,15 +5179,16 @@ export class CommandCenter {
 		const commitShortHashLength = config.get<number>('commitShortHashLength', 7);
 
 		const commit = await repository.getCommit(historyItemId);
-		const title = `${truncate(historyItemId, commitShortHashLength, false)} - ${truncate(commit.message)}`;
+		const title = `${truncate(historyItemId, commitShortHashLength, false)} - ${subject(commit.message)}`;
 		const historyItemParentId = commit.parents.length > 0 ? commit.parents[0] : await repository.getEmptyTree();
 
 		const multiDiffSourceUri = Uri.from({ scheme: 'scm-history-item', path: `${repository.root}/${historyItemParentId}..${historyItemId}` });
 
 		const changes = await repository.diffTrees(historyItemParentId, historyItemId);
 		const resources = changes.map(c => toMultiFileDiffEditorUris(c, historyItemParentId, historyItemId));
+		const reveal = revealUri ? { modifiedUri: toGitUri(revealUri, historyItemId) } : undefined;
 
-		await commands.executeCommand('_workbench.openMultiDiffEditor', { multiDiffSourceUri, title, resources });
+		await commands.executeCommand('_workbench.openMultiDiffEditor', { multiDiffSourceUri, title, resources, reveal });
 	}
 
 	@command('git.copyContentToClipboard')
@@ -5237,7 +5375,7 @@ export class CommandCenter {
 		};
 
 		// patch this object, so people can call methods directly
-		(this as any)[key] = result;
+		(this as Record<string, unknown>)[key] = result;
 
 		return result;
 	}

@@ -45,6 +45,10 @@
 	display: none;
 }
 
+.scm-view .scm-provider .monaco-icon-label-container {
+	display: flex;
+}
+
 .scm-view .scm-provider > .monaco-icon-label {
 	flex: 1;
 }
@@ -53,10 +57,6 @@
 	display: flex;
 	align-items: center;
 	font-weight: bold;
-}
-
-.scm-view .scm-provider .monaco-highlighted-label .codicon {
-	font-size: 14px;
 }
 
 .scm-view .scm-provider > .actions {
@@ -87,7 +87,6 @@
 }
 
 .scm-view .scm-provider > .actions > .monaco-toolbar > .monaco-action-bar > .actions-container  > .action-item > .action-label > .codicon {
-	font-size: 12px;
 	justify-content: center;
 }
 
@@ -492,6 +491,10 @@
 
 .scm-view.scm-repositories-view .monaco-highlighted-label {
 	font-weight: normal;
+}
+
+.scm-view.scm-repositories-view .scm-provider .monaco-icon-label-container {
+	display: flex;
 }
 
 /* History item hover */
